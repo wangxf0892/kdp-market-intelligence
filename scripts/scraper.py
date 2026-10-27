@@ -170,15 +170,14 @@ def main():
             break # 遇风控即停，保留已抓取数据
             
     if results:
-        file_exists = os.path.exists(OUTPUT_FILE)
-        with open(OUTPUT_FILE, 'a', newline='', encoding='utf-8') as f:
+        # 核心改动：使用 'w' 模式覆盖写入，每次都清空历史脏数据
+        with open(OUTPUT_FILE, 'w', newline='', encoding='utf-8') as f:
             fieldnames = ['timestamp', 'keyword', 'asin', 'title', 'bsr', 'rating', 'reviews']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if not file_exists or os.path.getsize(OUTPUT_FILE) == 0:
-                writer.writeheader()
+            writer.writeheader()
             for row in results:
                 writer.writerow(row)
-        print(f"[+] Wrote {len(results)} rows to {OUTPUT_FILE}")
+        print(f"[+] Overwrote {len(results)} fresh rows to {OUTPUT_FILE}")
 
 if __name__ == '__main__':
     main()
