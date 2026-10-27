@@ -6,7 +6,6 @@ import random
 from datetime import datetime
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BSR_FILE = os.path.join(BASE_DIR, 'data', 'bsr_report.csv')
@@ -30,23 +29,18 @@ def get_top_asins(limit=2):
     candidates.sort(key=lambda x: x['bsr'])
     return candidates[:limit]
 
-def scrape_reviews_with_stealth(page, asin):
-    """
-    注入真实浏览器指纹，抹除 webdriver 标识，直达买家评论归档页
-    """
+def scrape_reviews_with_native_stealth(page, asin):
     url = f"https://www.amazon.com/product-reviews/{asin}/?sortBy=recent&reviewerType=all_reviews"
-    print(f"[*] Navigating stealth browser to review center: {url}")
+    print(f"[*] Navigating to review center: {url}")
     
-    # 彻底抹除自动化指纹
-    stealth_sync(page)
-    
-    sleep_time = random.uniform(5, 8)
+    sleep_time = random.uniform(4, 7)
     time.sleep(sleep_time)
     
     try:
-        page.goto(url, wait_until="networkidle", timeout=35000)
+        # 页面级网络等待
+        page.goto(url, wait_until="domcontentloaded", timeout=40000)
+        time.sleep(3)
         
-        # 打印当前标题供日志排查
         page_title = page.title()
         print(f"[*] Landed on page title: '{page_title}'")
         
@@ -65,17 +59,14 @@ def scrape_reviews_with_stealth(page, asin):
         
         reviews = []
         for card in cards:
-            # 提取星级
             star_el = card.select_one('[data-hook="review-star-rating"] span.a-icon-alt') or card.select_one('.a-icon-alt')
             stars = star_el.get_text(strip=True) if star_el else "3.0 out of 5 stars"
             
-            # 提取标题
             title_el = card.select_one('[data-hook="review-title"] span:not(.a-letter-space)') or card.select_one('[data-hook="review-title"]')
             title = title_el.get_text(strip=True) if title_el else ""
             if "stars" in title:
                 title = title.split("stars")[-1].strip()
                 
-            # 提取正文
             body_el = card.select_one('[data-hook="review-body"] span') or card.select_one('[data-hook="review-body"]')
             body = body_el.get_text(strip=True) if body_el else ""
             
@@ -89,7 +80,7 @@ def scrape_reviews_with_stealth(page, asin):
         return reviews
         
     except Exception as e:
-        print(f"[!] Stealth scrape error on {asin}: {e}")
+        print(f"[!] Scrape error on {asin}: {e}")
         return []
 
 def categorize_pain_points(reviews):
@@ -183,7 +174,6 @@ def main():
         return
 
     with sync_playwright() as p:
-        # 启动带防指纹参数的 Chromium
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -198,15 +188,30 @@ def main():
             timezone_id="America/New_York",
             viewport={"width": 1920, "height": 1080}
         )
+        
+        # 原生防指纹注入：彻底抹除自动化标识
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+        """)
+        
         page = context.new_page()
 
         all_analyzed = []
         for target in top_targets:
-            print(f"[*] Analyzing competitor ASIN with Stealth Browser: {target['asin']} (#{target['bsr']})")
-            revs = scrape_reviews_with_stealth(page, target['asin'])
+            print(f"[*] Analyzing competitor ASIN: {target['asin']} (#{target['bsr']})")
+            revs = scrape_reviews_with_native_stealth(page, target['asin'])
             target['reviews'] = revs
             all_analyzed.append(target)
-            time.sleep(random.uniform(4, 7))
+            time.sleep(random.uniform(3, 6))
             
         browser.close()
 
