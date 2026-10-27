@@ -18,43 +18,57 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0'
 ]
 
-def get_headers():
+def get_base_headers():
     return {
         'User-Agent': random.choice(USER_AGENTS),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Referer': 'https://www.google.com/',
-        'Device-Memory': '8',
         'DNT': '1'
     }
 
-def discover_asins_by_keyword(keyword, limit=10):
+def create_authenticated_session():
     """
-    根据关键词自动搜索亚马逊图书，自动提取前排自然排名的 ASIN
+    先访问首页换取合法 session-id Cookie，彻底规避白闯拦截
     """
+    session = requests.Session()
+    headers = get_base_headers()
+    try:
+        print("[*] Initializing Amazon session handshake...")
+        session.get("https://www.amazon.com", headers=headers, timeout=15)
+        time.sleep(random.uniform(2, 4))
+    except Exception as e:
+        print(f"[!] Session init warning: {e}")
+    return session
+
+def discover_asins_by_keyword(session, keyword, limit=5):
     encoded_kw = urllib.parse.quote_plus(keyword)
-    # 锁定 Books 类目进行搜索
     url = f"https://www.amazon.com/s?k={encoded_kw}&i=stripbooks"
-    headers = get_headers()
+    headers = get_base_headers()
+    headers['Referer'] = 'https://www.amazon.com/'
     
     print(f"[*] Discovering targets for keyword: '{keyword}'...")
-    time.sleep(random.uniform(5, 10))
+    time.sleep(random.uniform(5, 8))
     
     try:
-        res = requests.get(url, headers=headers, timeout=25)
-        if res.status_code != 200 or "api-services-support@amazon.com" in res.text:
-            print(f"[!] Search blocked or captcha for '{keyword}'")
+        res = session.get(url, headers=headers, timeout=25)
+        
+        # 严格识别是否被打入 Robot Check 页面
+        if "Robot Check" in res.text or "validateCaptcha" in res.text:
+            print(f"[!] Hit Amazon Robot Check on keyword: '{keyword}'")
             return []
             
         soup = BeautifulSoup(res.text, 'html.parser')
-        # 匹配搜索结果页中所有带 data-asin 的卡片
-        cards = soup.find_all('div', {'data-asin': True})
         
+        # 锁定真正的自然排名搜索卡片
+        cards = soup.find_all('div', {'data-component-type': 's-search-result'})
+        if not cards:
+            # 备用选择器
+            cards = soup.find_all('div', {'data-asin': True})
+            
         found_asins = []
         for card in cards:
             asin = card.get('data-asin', '').strip()
-            # 过滤广告位（Sponsored）以及空 ASIN
+            # 过滤广告与无效项
             is_sponsored = "s-sponsored-label" in card.get_text() or "Sponsored" in card.get_text()
             if asin and not is_sponsored and len(asin) == 10:
                 if asin not in found_asins:
@@ -102,19 +116,19 @@ def extract_review_count(soup, html_text):
             return count_match.group(1).replace(',', '')
     return "0"
 
-def scrape_asin(asin, keyword=""):
+def scrape_asin(session, asin, keyword=""):
     url = f"https://www.amazon.com/dp/{asin}"
-    headers = get_headers()
+    headers = get_base_headers()
+    headers['Referer'] = 'https://www.amazon.com/'
     
-    sleep_time = random.uniform(15, 25)
+    sleep_time = random.uniform(12, 20)
     print(f"[*] Sleeping {sleep_time:.1f}s before fetching ASIN: {asin}")
     time.sleep(sleep_time)
     
     try:
-        session = requests.Session()
         res = session.get(url, headers=headers, timeout=25)
         
-        if "api-services-support@amazon.com" in res.text or "Type the characters you see in this image" in res.text:
+        if "Robot Check" in res.text or "validateCaptcha" in res.text:
             print(f"[!] Captcha triggered on ASIN: {asin}. Stopping run.")
             return None
             
@@ -148,13 +162,14 @@ def main():
         print("[!] keywords.txt not found. Exiting.")
         return
         
-    with open(KEYWORDS_FILE, 'r') as f:
+    with open(KEYWORDS_FILE, 'r', encoding='utf-8') as f:
         keywords = [line.strip() for line in f if line.strip()]
         
-    # 自动搜索提取 ASIN
+    session = create_authenticated_session()
+    
     all_targets = []
     for kw in keywords:
-        asins = discover_asins_by_keyword(kw, limit=5) # 每个词自动抓前5名真实竞品
+        asins = discover_asins_by_keyword(session, kw, limit=5)
         for asin in asins:
             all_targets.append({'asin': asin, 'keyword': kw})
             
@@ -162,15 +177,15 @@ def main():
     
     results = []
     for target in all_targets:
-        data = scrape_asin(target['asin'], target['keyword'])
+        data = scrape_asin(session, target['asin'], target['keyword'])
         if data:
             results.append(data)
             print(f"[+] Scraped {target['asin']} ({data['keyword']}): BSR={data['bsr']}, Rating={data['rating']}")
         else:
-            break # 遇风控即停，保留已抓取数据
+            break
             
     if results:
-        # 核心改动：使用 'w' 模式覆盖写入，每次都清空历史脏数据
+        # 覆盖更新最新快照
         with open(OUTPUT_FILE, 'w', newline='', encoding='utf-8') as f:
             fieldnames = ['timestamp', 'keyword', 'asin', 'title', 'bsr', 'rating', 'reviews']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
