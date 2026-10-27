@@ -20,7 +20,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install requests beautifulsoup4 playwright playwright-stealth
+          pip install requests beautifulsoup4 playwright
           playwright install chromium --with-deps
 
       - name: Execute Scraper
@@ -36,4 +36,4 @@ jobs:
           git config --global user.name "MarketIntelligenceBot"
           git config --global user.email "bot@github.local"
           git add data/
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update BSR & stealth reviews [skip ci]" && git push)
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update BSR & native stealth reviews [skip ci]" && git push)
