@@ -17,14 +17,6 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0'
 ]
 
-def get_base_headers():
-    return {
-        'User-Agent': random.choice(USER_AGENTS),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'DNT': '1'
-    }
-
 def get_top_asins(limit=3):
     if not os.path.exists(BSR_FILE):
         return []
@@ -43,72 +35,104 @@ def get_top_asins(limit=3):
     candidates.sort(key=lambda x: x['bsr'])
     return candidates[:limit]
 
-def scrape_reviews_from_dp(session, asin):
-    """直接在商品详情页抓取买家实际评价，避开高危的 product-reviews 子路径"""
-    url = f"https://www.amazon.com/dp/{asin}"
-    headers = get_base_headers()
-    headers['Referer'] = 'https://www.amazon.com/'
+def fetch_reviews_via_ajax(session, asin, filter_star="critical"):
+    """
+    通过亚马逊底层 AJAX 接口直取评论片段，绕开详情页的 JS 懒加载壁垒
+    """
+    url = "https://www.amazon.com/hz/reviews-render/ajax/reviews/get"
+    headers = {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'Referer': f'https://www.amazon.com/dp/{asin}',
+        'Origin': 'https://www.amazon.com',
+        'DNT': '1'
+    }
     
-    sleep_time = random.uniform(8, 15)
-    print(f"[*] Sleeping {sleep_time:.1f}s before parsing reviews on ASIN: {asin}")
+    payload = {
+        'sortBy': 'recent',
+        'reviewerType': 'all_reviews',
+        'formatType': '',
+        'mediaType': '',
+        'filterByStar': filter_star, # "critical" (1-3星) 或 "" (全部)
+        'filterByAge': '',
+        'pageNumber': '1',
+        'filterByLanguage': '',
+        'filterByKeyword': '',
+        'shouldAppend': 'undefined',
+        'deviceType': 'desktop',
+        'canShowIntHeader': 'undefined',
+        'reftag': 'cm_cr_arp_d_paging_btm_next_1',
+        'pageSize': '10',
+        'asin': asin,
+        'scope': 'reviewsAjax0'
+    }
+    
+    sleep_time = random.uniform(8, 14)
+    print(f"[*] Sleeping {sleep_time:.1f}s before AJAX review fetch on ASIN: {asin} (filter={filter_star})")
     time.sleep(sleep_time)
     
     try:
-        res = session.get(url, headers=headers, timeout=25)
-        if res.status_code != 200 or "Robot Check" in res.text:
-            print(f"[!] Blocked or captcha on {asin}")
+        res = session.post(url, headers=headers, data=payload, timeout=25)
+        if res.status_code != 200:
+            print(f"[!] AJAX returned status {res.status_code} for {asin}")
             return []
             
-        soup = BeautifulSoup(res.text, 'html.parser')
+        # 接口返回的是以 &&& 分隔的片段，包含转义后的 HTML
+        clean_html = res.text.replace(r'\"', '"').replace(r'\/', '/')
+        soup = BeautifulSoup(clean_html, 'html.parser')
         
-        # 兼容两种常见评论容器
-        review_cards = soup.find_all('div', {'data-hook': 'review'})
-        if not review_cards:
-            review_cards = soup.select('#cm-cr-dp-review-list div.a-section.review')
+        cards = soup.find_all('div', {'data-hook': 'review'})
+        if not cards:
+            cards = soup.select('.review')
             
-        parsed_reviews = []
-        for card in review_cards:
+        reviews = []
+        for card in cards:
             # 提取星级
             star_tag = card.find('i', {'data-hook': 'review-star-rating'}) or card.find('span', {'class': 'a-icon-alt'})
-            stars_text = star_tag.get_text(strip=True) if star_tag else ""
+            stars_text = star_tag.get_text(strip=True) if star_tag else "3.0 out of 5 stars"
             
-            # 判断星级数值
-            star_num = 5.0
-            star_match = re.search(r'([0-5]\.[0-9])', stars_text)
-            if star_match:
-                star_num = float(star_match.group(1))
-            elif "1." in stars_text or "1 out" in stars_text:
+            star_num = 3.0
+            match = re.search(r'([0-5]\.[0-9])', stars_text)
+            if match:
+                star_num = float(match.group(1))
+            elif "1" in stars_text:
                 star_num = 1.0
-            elif "2." in stars_text or "2 out" in stars_text:
+            elif "2" in stars_text:
                 star_num = 2.0
-            elif "3." in stars_text or "3 out" in stars_text:
-                star_num = 3.0
                 
-            # 提取标题与正文
+            # 提取标题
             title_tag = card.find('a', {'data-hook': 'review-title'}) or card.find('span', {'data-hook': 'review-title'})
             title = title_tag.get_text(strip=True) if title_tag else ""
             if "stars" in title:
                 title = title.split("stars")[-1].strip()
                 
+            # 提取正文
             body_tag = card.find('span', {'data-hook': 'review-body'})
             body = body_tag.get_text(strip=True) if body_tag else ""
             
-            # 重点收割 1~3 星，但如果详情页展示的全是好评，也提取其中带有 "however", "but", "wish", "mistake" 的转折抱怨句
-            is_critical = star_num <= 3.5
-            has_negative_keywords = any(k in body.lower() for k in ['but', 'however', 'mistake', 'error', 'wrong', 'wish', 'missing', 'typo', 'confusing'])
-            
-            if body and (is_critical or has_negative_keywords):
-                parsed_reviews.append({
+            if body:
+                reviews.append({
                     'stars': f"{star_num} stars",
                     'title': title,
                     'body': body
                 })
                 
-        print(f"[+] Found {len(parsed_reviews)} actionable critique reviews for {asin}")
-        return parsed_reviews
+        print(f"[+] Successfully extracted {len(reviews)} reviews for {asin}")
+        return reviews
     except Exception as e:
-        print(f"[!] Error on {asin}: {e}")
+        print(f"[!] Error on AJAX {asin}: {e}")
         return []
+
+def scrape_reviews_for_asin(session, asin):
+    # 优先抓取 1-3 星差评
+    reviews = fetch_reviews_via_ajax(session, asin, filter_star="critical")
+    # 如果该品只有很少差评，退一步抓最新所有评论从中筛选抱怨
+    if not reviews:
+        print(f"[*] Critical empty for {asin}, fetching all recent reviews...")
+        reviews = fetch_reviews_via_ajax(session, asin, filter_star="")
+    return reviews
 
 def categorize_pain_points(reviews):
     buckets = {
@@ -118,7 +142,7 @@ def categorize_pain_points(reviews):
         "内容过时 / 与新考试不符 (Outdated Content)": [],
         "线上激活码失效 / 强制注册 (Online Code / Login Traps)": [],
         "题目太少 / 刷题不尽兴 (Not Enough Practice)": [],
-        "一般槽点 / 体验遗憾 (Specific Complaints)": []
+        "其他买家吐槽 (General Dissatisfaction)": []
     }
     
     for r in reviews:
@@ -134,7 +158,7 @@ def categorize_pain_points(reviews):
         if any(w in text for w in ['format', 'font', 'print', 'small text', 'cheap paper', 'spacing', 'hard to read']):
             buckets["排版混乱 / 字体不适 (Formatting & Layout Issues)"].append(r)
             matched = True
-        if any(w in text for w in ['outdated', 'old version', 'not on the test', 'changed format', '2024', '2025']):
+        if any(w in text for w in ['outdated', 'old version', 'not on the test', 'changed format']):
             buckets["内容过时 / 与新考试不符 (Outdated Content)"].append(r)
             matched = True
         if any(w in text for w in ['login', 'website', 'code', 'online access', 'register', 'expired', 'account']):
@@ -145,7 +169,7 @@ def categorize_pain_points(reviews):
             matched = True
             
         if not matched:
-            buckets["一般槽点 / 体验遗憾 (Specific Complaints)"].append(r)
+            buckets["其他买家吐槽 (General Dissatisfaction)"].append(r)
             
     return buckets
 
@@ -162,27 +186,26 @@ def generate_markdown_report(targets_data):
         
         md.append(f"## 🎯 目标竞品: `{asin}` (BSR: #{bsr})\n")
         md.append(f"**标题**: {title}\n")
-        md.append(f"**提炼出的负面/批判性反馈样本**: {len(reviews)} 条\n\n")
+        md.append(f"**成功捕获买家反馈样本**: {len(reviews)} 条\n\n")
         md.append(f"### ⚡ 提炼出的高频缺陷分布:\n")
         
         has_any_flaw = False
         for category, revs in buckets.items():
             if revs:
                 has_any_flaw = True
-                md.append(f"#### 🔴 {category} ({len(revs)} 条买家明确吐槽)\n")
+                md.append(f"#### 🔴 {category} ({len(revs)} 条买家真实反馈)\n")
                 for sample in revs[:2]:
                     snippet = sample['body'].replace('\n', ' ')
-                    if len(snippet) > 250:
-                        snippet = snippet[:250] + "..."
+                    if len(snippet) > 280:
+                        snippet = snippet[:280] + "..."
                     md.append(f"> **评级: {sample['stars']} | \"{sample['title']}\"**  \n> {snippet}\n>\n")
                     
         if not has_any_flaw:
-            md.append("*(该竞品详情页暂未抓取到明显的差评段落)*\n")
+            md.append("*(该竞品暂未捕获到明显的负面抱怨段落)*\n")
 
         md.append("\n### 💡 针对该竞品的反制出版方案 (Counter-Strategy):\n")
-        # 挑选出现最多的缺陷作为核心主打
-        valid_buckets = {k: v for k, v in buckets.items() if k != "一般槽点 / 体验遗憾 (Specific Complaints)" and len(v) > 0}
-        top_flaw = max(valid_buckets.items(), key=lambda x: len(x[1]))[0] if valid_buckets else "缺乏详细解题步骤 (No Explanations / Too Vague)"
+        valid_buckets = {k: v for k, v in buckets.items() if k != "其他买家吐槽 (General Dissatisfaction)" and len(v) > 0}
+        top_flaw = max(valid_buckets.items(), key=lambda x: len(x[1]))[0] if valid_buckets else "答案错误 / 题目有 Bug (Errors in Answers)"
         
         md.append(f"- **核心反杀卖点**: 强攻 **【{top_flaw}】**。\n")
         md.append(f"- **封面与副标题反制话术**:\n")
@@ -193,7 +216,7 @@ def generate_markdown_report(targets_data):
         
     with open(OUTPUT_MD, 'w', encoding='utf-8') as f:
         f.write("\n".join(md))
-    print(f"[+] Battlecard generated at: {OUTPUT_MD}")
+    print(f"[+] Battlecard written to: {OUTPUT_MD}")
 
 def main():
     top_targets = get_top_asins(limit=3)
@@ -202,9 +225,8 @@ def main():
         return
         
     session = requests.Session()
-    # 模拟通用首页访问建立 Cookie
     try:
-        session.get("https://www.amazon.com", headers=get_base_headers(), timeout=15)
+        session.get("https://www.amazon.com", headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
         time.sleep(2)
     except:
         pass
@@ -212,7 +234,7 @@ def main():
     all_analyzed = []
     for target in top_targets:
         print(f"[*] Analyzing competitor ASIN: {target['asin']} (#{target['bsr']})")
-        revs = scrape_reviews_from_dp(session, target['asin'])
+        revs = scrape_reviews_for_asin(session, target['asin'])
         target['reviews'] = revs
         all_analyzed.append(target)
         
