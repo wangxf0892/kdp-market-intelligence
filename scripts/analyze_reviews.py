@@ -6,6 +6,7 @@ import random
 from datetime import datetime
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BSR_FILE = os.path.join(BASE_DIR, 'data', 'bsr_report.csv')
@@ -29,71 +30,66 @@ def get_top_asins(limit=2):
     candidates.sort(key=lambda x: x['bsr'])
     return candidates[:limit]
 
-def scrape_reviews_with_browser(page, asin):
+def scrape_reviews_with_stealth(page, asin):
     """
-    启动真实 Chrome 浏览器，模拟真人滚动页面，强制触发客户端 JavaScript 懒加载评论
+    注入真实浏览器指纹，抹除 webdriver 标识，直达买家评论归档页
     """
-    url = f"https://www.amazon.com/dp/{asin}"
-    print(f"[*] Navigating headless Chromium to: {url}")
+    url = f"https://www.amazon.com/product-reviews/{asin}/?sortBy=recent&reviewerType=all_reviews"
+    print(f"[*] Navigating stealth browser to review center: {url}")
+    
+    # 彻底抹除自动化指纹
+    stealth_sync(page)
+    
+    sleep_time = random.uniform(5, 8)
+    time.sleep(sleep_time)
     
     try:
-        # 打开页面，等待网络空闲
-        page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        time.sleep(3)
+        page.goto(url, wait_until="networkidle", timeout=35000)
         
-        # 检查是否遇到验证码
-        if "Robot Check" in page.title() or page.locator("form[action*='validateCaptcha']").count() > 0:
-            print(f"[!] Captcha hit on browser for {asin}")
+        # 打印当前标题供日志排查
+        page_title = page.title()
+        print(f"[*] Landed on page title: '{page_title}'")
+        
+        if "Robot Check" in page_title or page.locator("form[action*='validateCaptcha']").count() > 0:
+            print(f"[!] Hit Amazon Robot Check for ASIN: {asin}")
             return []
             
-        # 核心动作：模拟真实用户向下滚动触发懒加载
-        print("[*] Scrolling to activate lazy-loaded customer reviews...")
-        for _ in range(3):
-            page.evaluate("window.scrollBy(0, 1800);")
-            time.sleep(2)
-            
-        # 尝试显式等待评论容器渲染（最多等 8 秒）
-        try:
-            page.wait_for_selector("#cm-cr-dp-review-list, [data-hook='review']", timeout=8000)
-        except:
-            pass
-
         html = page.content()
         soup = BeautifulSoup(html, 'html.parser')
         
-        cards = soup.select('[data-hook="review"]')
+        cards = soup.select('div[data-hook="review"]')
         if not cards:
-            cards = soup.select('#cm-cr-dp-review-list div.review')
+            cards = soup.select('.review')
             
-        print(f"[+] Successfully extracted {len(cards)} review elements via Playwright for {asin}")
+        print(f"[+] Found {len(cards)} review elements for {asin}")
         
         reviews = []
         for card in cards:
             # 提取星级
-            star_el = card.select_one('[data-hook="review-star-rating"]') or card.select_one('.a-icon-alt')
+            star_el = card.select_one('[data-hook="review-star-rating"] span.a-icon-alt') or card.select_one('.a-icon-alt')
             stars = star_el.get_text(strip=True) if star_el else "3.0 out of 5 stars"
             
             # 提取标题
-            title_el = card.select_one('[data-hook="review-title"]')
+            title_el = card.select_one('[data-hook="review-title"] span:not(.a-letter-space)') or card.select_one('[data-hook="review-title"]')
             title = title_el.get_text(strip=True) if title_el else ""
             if "stars" in title:
                 title = title.split("stars")[-1].strip()
                 
             # 提取正文
-            body_el = card.select_one('[data-hook="review-body"]')
+            body_el = card.select_one('[data-hook="review-body"] span') or card.select_one('[data-hook="review-body"]')
             body = body_el.get_text(strip=True) if body_el else ""
             
             if body:
                 reviews.append({
                     'stars': stars,
                     'title': title,
-                    'body': body
+                    'body': body.replace('\n', ' ').strip()
                 })
                 
         return reviews
         
     except Exception as e:
-        print(f"[!] Browser scrape error on {asin}: {e}")
+        print(f"[!] Stealth scrape error on {asin}: {e}")
         return []
 
 def categorize_pain_points(reviews):
@@ -104,7 +100,7 @@ def categorize_pain_points(reviews):
         "内容过时 / 与新考试不符 (Outdated Content)": [],
         "线上激活码失效 / 强制注册 (Online Code / Login Traps)": [],
         "题目太少 / 刷题不尽兴 (Not Enough Practice)": [],
-        "其他买家真实吐槽与反馈 (General Complaints)": []
+        "其他买家真实原话反馈 (General Feedback)": []
     }
     
     for r in reviews:
@@ -131,7 +127,7 @@ def categorize_pain_points(reviews):
             matched = True
             
         if not matched:
-            buckets["其他买家真实吐槽与反馈 (General Complaints)"].append(r)
+            buckets["其他买家真实原话反馈 (General Feedback)"].append(r)
             
     return buckets
 
@@ -148,7 +144,7 @@ def generate_markdown_report(targets_data):
         
         md.append(f"## 🎯 目标竞品: `{asin}` (BSR: #{bsr})\n")
         md.append(f"**标题**: {title}\n")
-        md.append(f"**成功抓获真实买家反馈**: {len(reviews)} 条\n\n")
+        md.append(f"**成功截获真实买家反馈**: {len(reviews)} 条\n\n")
         md.append(f"### ⚡ 提炼出的高频缺陷分布:\n")
         
         has_any_flaw = False
@@ -157,16 +153,16 @@ def generate_markdown_report(targets_data):
                 has_any_flaw = True
                 md.append(f"#### 🔴 {category} ({len(revs)} 条买家真实原话)\n")
                 for sample in revs[:3]:
-                    snippet = sample['body'].replace('\n', ' ')
+                    snippet = sample['body']
                     if len(snippet) > 280:
                         snippet = snippet[:280] + "..."
                     md.append(f"> **评级: {sample['stars']} | \"{sample['title']}\"**  \n> {snippet}\n>\n")
                     
         if not has_any_flaw:
-            md.append("*(该竞品页面未抓取到有效文本)*\n")
+            md.append("*(该竞品页面未截获到有效文本)*\n")
 
         md.append("\n### 💡 针对该竞品的反制出版方案 (Counter-Strategy):\n")
-        valid_buckets = {k: v for k, v in buckets.items() if k != "其他买家真实吐槽与反馈 (General Complaints)" and len(v) > 0}
+        valid_buckets = {k: v for k, v in buckets.items() if k != "其他买家真实原话反馈 (General Feedback)" and len(v) > 0}
         top_flaw = max(valid_buckets.items(), key=lambda x: len(x[1]))[0] if valid_buckets else "答案错误 / 题目有 Bug (Errors in Answers)"
         
         md.append(f"- **核心反杀卖点**: 强攻 **【{top_flaw}】**。\n")
@@ -187,22 +183,30 @@ def main():
         return
 
     with sync_playwright() as p:
-        # 启动 Chromium 无头浏览器，配置真实视口与语言环境
-        browser = p.chromium.launch(headless=True)
+        # 启动带防指纹参数的 Chromium
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-setuid-sandbox'
+            ]
+        )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             locale="en-US",
-            viewport={"width": 1440, "height": 900}
+            timezone_id="America/New_York",
+            viewport={"width": 1920, "height": 1080}
         )
         page = context.new_page()
 
         all_analyzed = []
         for target in top_targets:
-            print(f"[*] Analyzing competitor ASIN with Chromium: {target['asin']} (#{target['bsr']})")
-            revs = scrape_reviews_with_browser(page, target['asin'])
+            print(f"[*] Analyzing competitor ASIN with Stealth Browser: {target['asin']} (#{target['bsr']})")
+            revs = scrape_reviews_with_stealth(page, target['asin'])
             target['reviews'] = revs
             all_analyzed.append(target)
-            time.sleep(random.uniform(5, 8))
+            time.sleep(random.uniform(4, 7))
             
         browser.close()
 
