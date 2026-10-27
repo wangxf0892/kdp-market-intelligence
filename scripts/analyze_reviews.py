@@ -4,6 +4,7 @@ import csv
 import time
 import random
 import requests
+from bs4 import BeautifulSoup
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -15,6 +16,15 @@ USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
     'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0'
 ]
+
+def get_base_headers():
+    return {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.google.com/',
+        'DNT': '1'
+    }
 
 def get_top_asins(limit=3):
     if not os.path.exists(BSR_FILE):
@@ -34,57 +44,72 @@ def get_top_asins(limit=3):
     candidates.sort(key=lambda x: x['bsr'])
     return candidates[:limit]
 
-def fetch_reviews_via_woot(asin):
-    """
-    通过亚马逊子公司 Woot 的公开 JSON 接口提取真实亚马逊评论
-    绕过亚马逊主域名的 403 封锁
-    """
-    url = f"https://www.woot.com/review/Reviews/{asin}"
-    headers = {
-        'User-Agent': random.choice(USER_AGENTS),
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.woot.com/',
-        'DNT': '1'
-    }
+def scrape_reviews_direct(session, asin):
+    url = f"https://www.amazon.com/dp/{asin}"
+    headers = get_base_headers()
     
-    sleep_time = random.uniform(3, 6)
-    print(f"[*] Sleeping {sleep_time:.1f}s before fetching Woot endpoint for ASIN: {asin}")
+    sleep_time = random.uniform(8, 14)
+    print(f"[*] Sleeping {sleep_time:.1f}s before fetching DP page for ASIN: {asin}")
     time.sleep(sleep_time)
     
     try:
-        res = requests.get(url, headers=headers, timeout=20)
-        print(f"[*] Woot endpoint status={res.status_code}, len={len(res.text)}")
+        res = session.get(url, headers=headers, timeout=25)
+        print(f"[*] Fetched {asin}: status={res.status_code}, html_len={len(res.text)}")
         
         if res.status_code != 200:
             return []
             
-        data = res.json()
-        raw_reviews = data.get('Reviews', []) or data.get('reviews', []) or []
-        
+        soup = BeautifulSoup(res.text, 'html.parser')
         reviews = []
-        for r in raw_reviews:
-            # 提取字段
-            star_rating = float(r.get('Rating') or r.get('StarRating') or r.get('rating') or 3.0)
-            title = r.get('Title') or r.get('title') or ""
-            body = r.get('Text') or r.get('Body') or r.get('text') or r.get('body') or ""
+        
+        # 策略 1：多选择器遍历
+        cards = soup.select('div[data-hook="review"]')
+        if not cards:
+            cards = soup.select('#cm-cr-dp-review-list div.review')
+        if not cards:
+            cards = soup.select('div.a-section.review')
             
-            # 清理正文中的 HTML 标签与换行
-            clean_body = re.sub(r'<.*?>', '', body).strip()
+        print(f"[*] Found {len(cards)} raw review card elements in DOM")
+        
+        for card in cards:
+            # 提取星级
+            star_el = card.select_one('[data-hook="review-star-rating"]') or card.select_one('.a-icon-alt')
+            stars = star_el.get_text(strip=True) if star_el else "3.0 out of 5 stars"
             
-            if clean_body:
-                reviews.append({
-                    'stars': f"{star_rating} stars",
-                    'star_val': star_rating,
-                    'title': title,
-                    'body': clean_body
-                })
+            # 提取标题
+            title_el = card.select_one('[data-hook="review-title"]') or card.select_one('a.review-title')
+            title = title_el.get_text(strip=True) if title_el else ""
+            if "stars" in title:
+                title = title.split("stars")[-1].strip()
                 
-        print(f"[+] Total reviews successfully parsed from Woot for {asin}: {len(reviews)}")
+            # 提取正文
+            body_el = card.select_one('[data-hook="review-body"]') or card.select_one('.review-text')
+            body = body_el.get_text(strip=True) if body_el else ""
+            
+            if body:
+                reviews.append({'stars': stars, 'title': title, 'body': body})
+
+        # 策略 2：如果 DOM 没抓到，直接正则扫页面源码内嵌的评论文本块
+        if not reviews:
+            print("[*] DOM cards empty, running regex fallback across raw HTML...")
+            bodies = re.findall(r'data-hook=["\']review-body["\'][^>]*>.*?<span[^>]*>(.*?)</span>', res.text, re.DOTALL)
+            titles = re.findall(r'data-hook=["\']review-title["\'][^>]*>.*?<span[^>]*>(.*?)</span>', res.text, re.DOTALL)
+            
+            for i in range(min(len(bodies), len(titles))):
+                clean_body = re.sub(r'<.*?>', '', bodies[i]).strip()
+                clean_title = re.sub(r'<.*?>', '', titles[i]).strip()
+                if clean_body:
+                    reviews.append({
+                        'stars': "Customer Feedback",
+                        'title': clean_title,
+                        'body': clean_body
+                    })
+
+        print(f"[+] Total reviews successfully parsed for {asin}: {len(reviews)}")
         return reviews
         
     except Exception as e:
-        print(f"[!] Error on Woot API for {asin}: {e}")
+        print(f"[!] Error on DP scrape for {asin}: {e}")
         return []
 
 def categorize_pain_points(reviews):
@@ -95,7 +120,7 @@ def categorize_pain_points(reviews):
         "内容过时 / 与新考试不符 (Outdated Content)": [],
         "线上激活码失效 / 强制注册 (Online Code / Login Traps)": [],
         "题目太少 / 刷题不尽兴 (Not Enough Practice)": [],
-        "其他买家吐槽与反馈 (General Complaints)": []
+        "一般买家吐槽与反馈 (General Feedback)": []
     }
     
     for r in reviews:
@@ -122,7 +147,7 @@ def categorize_pain_points(reviews):
             matched = True
             
         if not matched:
-            buckets["其他买家吐槽与反馈 (General Complaints)"].append(r)
+            buckets["一般买家吐槽与反馈 (General Feedback)"].append(r)
             
     return buckets
 
@@ -139,7 +164,7 @@ def generate_markdown_report(targets_data):
         
         md.append(f"## 🎯 目标竞品: `{asin}` (BSR: #{bsr})\n")
         md.append(f"**标题**: {title}\n")
-        md.append(f"**捕获买家反馈样本总数**: {len(reviews)} 条\n\n")
+        md.append(f"**成功捕获买家反馈样本**: {len(reviews)} 条\n\n")
         md.append(f"### ⚡ 提炼出的高频缺陷分布:\n")
         
         has_any_flaw = False
@@ -154,10 +179,10 @@ def generate_markdown_report(targets_data):
                     md.append(f"> **评级: {sample['stars']} | \"{sample['title']}\"**  \n> {snippet}\n>\n")
                     
         if not has_any_flaw:
-            md.append("*(该竞品暂未捕获到明显的负面抱怨段落)*\n")
+            md.append("*(该竞品详情页评论未能抓取到)*\n")
 
         md.append("\n### 💡 针对该竞品的反制出版方案 (Counter-Strategy):\n")
-        valid_buckets = {k: v for k, v in buckets.items() if k != "其他买家吐槽与反馈 (General Complaints)" and len(v) > 0}
+        valid_buckets = {k: v for k, v in buckets.items() if k != "一般买家吐槽与反馈 (General Feedback)" and len(v) > 0}
         top_flaw = max(valid_buckets.items(), key=lambda x: len(x[1]))[0] if valid_buckets else "答案错误 / 题目有 Bug (Errors in Answers)"
         
         md.append(f"- **核心反杀卖点**: 强攻 **【{top_flaw}】**。\n")
@@ -176,11 +201,19 @@ def main():
     if not top_targets:
         print("[!] No valid top BSR ASINs found in report.")
         return
+        
+    session = requests.Session()
+    # 首页预握手获取真实会话 Cookie
+    try:
+        session.get("https://www.amazon.com", headers=get_base_headers(), timeout=15)
+        time.sleep(2)
+    except:
+        pass
 
     all_analyzed = []
     for target in top_targets:
-        print(f"[*] Analyzing competitor ASIN via Woot: {target['asin']} (#{target['bsr']})")
-        revs = fetch_reviews_via_woot(target['asin'])
+        print(f"[*] Analyzing competitor ASIN: {target['asin']} (#{target['bsr']})")
+        revs = scrape_reviews_direct(session, target['asin'])
         target['reviews'] = revs
         all_analyzed.append(target)
         
