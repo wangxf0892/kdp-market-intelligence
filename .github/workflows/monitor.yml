@@ -1,0 +1,35 @@
+name: KDP Market Monitor
+
+on:
+  schedule:
+    # 每天 UTC 03:00（美东时间夜间、避开高频爬虫高峰期）自动执行
+    - cron: '0 3 * * *'
+  workflow_dispatch: # 支持随时在 GitHub 网页上手动点“Run”
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install requests beautifulsoup4
+
+      - name: Execute Scraper
+        run: |
+          python scripts/scraper.py
+
+      - name: Commit and Push Results
+        run: |
+          git config --global user.name "MarketIntelligenceBot"
+          git config --global user.email "bot@github.local"
+          git add data/
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update BSR data [skip ci]" && git push)
