@@ -7,7 +7,6 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 
-# 基础路径配置
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGETS_FILE = os.path.join(BASE_DIR, 'data', 'targets.txt')
 OUTPUT_FILE = os.path.join(BASE_DIR, 'data', 'bsr_report.csv')
@@ -29,29 +28,69 @@ def get_headers():
         'DNT': '1'
     }
 
-def clean_bsr(text):
-    # 提取类似 "#1,234 in Books" 中的数字
-    match = re.search(r'#([0-9,]+)\s+in\s+Books', text)
+def extract_bsr(html_text):
+    """
+    通过正则扫描全文提取主类目（Books / Kindle Store）的 BSR 排名
+    """
+    # 规则 1：匹配 "Best Sellers Rank: #1,234 in Books" 或 "#1,234 in Kindle Store"
+    patterns = [
+        r'Best Sellers Rank[^\d#]*#([0-9,]+)\s+in\s+([A-Za-z\s&]+)',
+        r'#([0-9,]+)\s+in\s+Books',
+        r'#([0-9,]+)\s+in\s+Kindle Store',
+        r'Best\s+Sellers\s+Rank:[^\n\r<]*#([0-9,]+)'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text, re.IGNORECASE)
+        if match:
+            raw_rank = match.group(1).replace(',', '').strip()
+            if raw_rank.isdigit():
+                return int(raw_rank)
+    return "Not Found"
+
+def extract_rating(soup, html_text):
+    """
+    精准锁定真实用户评分，避开轮播图组件里的伪图标
+    """
+    # 策略 1：锁定评论统计容器中的星级
+    rev_container = soup.find('div', {'id': 'averageCustomerReviews'})
+    if rev_container:
+        rating_span = rev_container.find('span', {'class': 'a-icon-alt'})
+        if rating_span and 'out of 5 stars' in rating_span.text:
+            return rating_span.text.strip()
+
+    # 策略 2：正则扫描 "X.X out of 5 stars"
+    match = re.search(r'([0-5]\.[0-9])\s+out of 5 stars', html_text)
     if match:
-        return int(match.group(1).replace(',', ''))
-    return None
+        return f"{match.group(1)} out of 5 stars"
+
+    return "N/A"
+
+def extract_review_count(soup, html_text):
+    """
+    提取总评论数
+    """
+    count_tag = soup.find('span', {'id': 'acrCustomerReviewText'})
+    if count_tag:
+        count_match = re.search(r'([0-9,]+)', count_tag.text)
+        if count_match:
+            return count_match.group(1).replace(',', '')
+    return "0"
 
 def scrape_asin(asin):
     url = f"https://www.amazon.com/dp/{asin}"
     headers = get_headers()
     
-    # 随机延时 15-30 秒，防止请求频率过高触发封锁
-    sleep_time = random.uniform(15, 30)
+    sleep_time = random.uniform(15, 25)
     print(f"[*] Sleeping {sleep_time:.1f}s before fetching ASIN: {asin}")
     time.sleep(sleep_time)
     
     try:
         session = requests.Session()
-        res = session.get(url, headers=headers, timeout=20)
+        res = session.get(url, headers=headers, timeout=25)
         
-        # 遇验证码直接终止，保护 Actions 运行环境不被列入黑名单
+        # 遇验证码直接安全退出
         if "api-services-support@amazon.com" in res.text or "Type the characters you see in this image" in res.text:
-            print(f"[!] Captcha triggered on ASIN: {asin}. Terminating run cleanly.")
+            print(f"[!] Captcha triggered on ASIN: {asin}. Terminating cleanly.")
             return None
             
         if res.status_code != 200:
@@ -64,32 +103,22 @@ def scrape_asin(asin):
         title_tag = soup.find('span', {'id': 'productTitle'})
         title = title_tag.get_text(strip=True) if title_tag else "Unknown Title"
         
-        # 抓取评分与评价数
-        rating_tag = soup.find('span', {'class': 'a-icon-alt'})
-        rating = rating_tag.get_text(strip=True) if rating_tag else "N/A"
-        
-        # 抓取 BSR
-        bsr = None
-        details = soup.find('div', {'id': 'detailBullets_feature_div'})
-        if details:
-            bsr = clean_bsr(details.get_text())
-        
-        if not bsr:
-            # 针对不同页面模板的兜底查找
-            sales_rank = soup.find('tr', {'id': 'SalesRank'})
-            if sales_rank:
-                bsr = clean_bsr(sales_rank.get_text())
+        # 提取核心数据
+        bsr = extract_bsr(res.text)
+        rating = extract_rating(soup, res.text)
+        reviews = extract_review_count(soup, res.text)
 
         return {
             'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
             'asin': asin,
-            'title': title[:80], # 截短方便查看
-            'bsr': bsr if bsr else "Not Found",
-            'rating': rating
+            'title': title[:60],
+            'bsr': bsr,
+            'rating': rating,
+            'reviews': reviews
         }
         
     except Exception as e:
-        print(f"[!] Request error on {asin}: {str(e)}")
+        print(f"[!] Error on {asin}: {str(e)}")
         return None
 
 def main():
@@ -105,20 +134,20 @@ def main():
         data = scrape_asin(asin)
         if data:
             results.append(data)
-            print(f"[+] Scraped {asin}: BSR={data['bsr']}, Rating={data['rating']}")
+            print(f"[+] Scraped {asin}: BSR={data['bsr']}, Rating={data['rating']}, Reviews={data['reviews']}")
         else:
-            # 如果触发验证码，终止后续抓取
             break
             
     if results:
         file_exists = os.path.exists(OUTPUT_FILE)
         with open(OUTPUT_FILE, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['timestamp', 'asin', 'title', 'bsr', 'rating'])
-            if not file_exists:
+            fieldnames = ['timestamp', 'asin', 'title', 'bsr', 'rating', 'reviews']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists or os.path.getsize(OUTPUT_FILE) == 0:
                 writer.writeheader()
             for row in results:
                 writer.writerow(row)
-        print(f"[+] Successfully wrote {len(results)} rows to {OUTPUT_FILE}")
+        print(f"[+] Wrote {len(results)} rows to {OUTPUT_FILE}")
 
 if __name__ == '__main__':
     main()
