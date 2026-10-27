@@ -2,9 +2,8 @@ name: KDP Market Monitor
 
 on:
   schedule:
-    # 每天 UTC 03:00（美东时间夜间、避开高频爬虫高峰期）自动执行
     - cron: '0 3 * * *'
-  workflow_dispatch: # 支持随时在 GitHub 网页上手动点“Run”
+  workflow_dispatch:
 
 jobs:
   run-monitor:
@@ -27,9 +26,13 @@ jobs:
         run: |
           python scripts/scraper.py
 
+      - name: Execute Negative Review Analyzer
+        run: |
+          python scripts/analyze_reviews.py
+
       - name: Commit and Push Results
         run: |
           git config --global user.name "MarketIntelligenceBot"
           git config --global user.email "bot@github.local"
           git add data/
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update BSR data [skip ci]" && git push)
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update BSR & pain points [skip ci]" && git push)
