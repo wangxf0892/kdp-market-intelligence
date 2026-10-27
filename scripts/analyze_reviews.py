@@ -1,6 +1,7 @@
 import os
 import re
 import csv
+import ast
 import time
 import random
 import requests
@@ -14,7 +15,7 @@ OUTPUT_MD = os.path.join(BASE_DIR, 'data', 'pain_points_report.md')
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0'
+    'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0'
 ]
 
 def get_top_asins(limit=3):
@@ -35,11 +36,11 @@ def get_top_asins(limit=3):
     candidates.sort(key=lambda x: x['bsr'])
     return candidates[:limit]
 
-def fetch_reviews_via_ajax(session, asin, filter_star="critical"):
+def fetch_reviews_via_ajax(session, asin):
     """
-    通过亚马逊底层 AJAX 接口直取评论片段，绕开详情页的 JS 懒加载壁垒
+    直连带签名路由的 AJAX 管道，并通过 AST 反序列化精确还原 HTML
     """
-    url = "https://www.amazon.com/hz/reviews-render/ajax/reviews/get"
+    url = "https://www.amazon.com/hz/reviews-render/ajax/reviews/get/ref=cm_cr_arp_d_paging_btm_next_2"
     headers = {
         'User-Agent': random.choice(USER_AGENTS),
         'Accept': 'text/html,*/*',
@@ -55,7 +56,7 @@ def fetch_reviews_via_ajax(session, asin, filter_star="critical"):
         'reviewerType': 'all_reviews',
         'formatType': '',
         'mediaType': '',
-        'filterByStar': filter_star, # "critical" (1-3星) 或 "" (全部)
+        'filterByStar': '',  # 不在服务端限制，拿取全量近期反馈
         'filterByAge': '',
         'pageNumber': '1',
         'filterByLanguage': '',
@@ -63,76 +64,83 @@ def fetch_reviews_via_ajax(session, asin, filter_star="critical"):
         'shouldAppend': 'undefined',
         'deviceType': 'desktop',
         'canShowIntHeader': 'undefined',
-        'reftag': 'cm_cr_arp_d_paging_btm_next_1',
+        'reftag': 'cm_cr_arp_d_paging_btm_next_2',
         'pageSize': '10',
         'asin': asin,
         'scope': 'reviewsAjax0'
     }
     
     sleep_time = random.uniform(8, 14)
-    print(f"[*] Sleeping {sleep_time:.1f}s before AJAX review fetch on ASIN: {asin} (filter={filter_star})")
+    print(f"[*] Sleeping {sleep_time:.1f}s before fetching AJAX reviews for ASIN: {asin}")
     time.sleep(sleep_time)
     
     try:
         res = session.post(url, headers=headers, data=payload, timeout=25)
+        print(f"[*] AJAX response status={res.status_code}, len={len(res.text)}")
+        
         if res.status_code != 200:
-            print(f"[!] AJAX returned status {res.status_code} for {asin}")
             return []
             
-        # 接口返回的是以 &&& 分隔的片段，包含转义后的 HTML
-        clean_html = res.text.replace(r'\"', '"').replace(r'\/', '/')
-        soup = BeautifulSoup(clean_html, 'html.parser')
-        
-        cards = soup.find_all('div', {'data-hook': 'review'})
-        if not cards:
-            cards = soup.select('.review')
-            
-        reviews = []
-        for card in cards:
-            # 提取星级
-            star_tag = card.find('i', {'data-hook': 'review-star-rating'}) or card.find('span', {'class': 'a-icon-alt'})
-            stars_text = star_tag.get_text(strip=True) if star_tag else "3.0 out of 5 stars"
-            
-            star_num = 3.0
-            match = re.search(r'([0-5]\.[0-9])', stars_text)
-            if match:
-                star_num = float(match.group(1))
-            elif "1" in stars_text:
-                star_num = 1.0
-            elif "2" in stars_text:
-                star_num = 2.0
-                
-            # 提取标题
-            title_tag = card.find('a', {'data-hook': 'review-title'}) or card.find('span', {'data-hook': 'review-title'})
-            title = title_tag.get_text(strip=True) if title_tag else ""
-            if "stars" in title:
-                title = title.split("stars")[-1].strip()
-                
-            # 提取正文
-            body_tag = card.find('span', {'data-hook': 'review-body'})
-            body = body_tag.get_text(strip=True) if body_tag else ""
-            
-            if body:
-                reviews.append({
-                    'stars': f"{star_num} stars",
-                    'title': title,
-                    'body': body
-                })
-                
-        print(f"[+] Successfully extracted {len(reviews)} reviews for {asin}")
-        return reviews
-    except Exception as e:
-        print(f"[!] Error on AJAX {asin}: {e}")
-        return []
+        if "Robot Check" in res.text:
+            print(f"[!] Captcha hit on reviews for ASIN: {asin}")
+            return []
 
-def scrape_reviews_for_asin(session, asin):
-    # 优先抓取 1-3 星差评
-    reviews = fetch_reviews_via_ajax(session, asin, filter_star="critical")
-    # 如果该品只有很少差评，退一步抓最新所有评论从中筛选抱怨
-    if not reviews:
-        print(f"[*] Critical empty for {asin}, fetching all recent reviews...")
-        reviews = fetch_reviews_via_ajax(session, asin, filter_star="")
-    return reviews
+        # 策略 1：使用标准 AST 反序列化提取真实 HTML
+        # 亚马逊返回结构为 &&&["append","#cm_cr-review_list","<div id=...</div>"]
+        raw_divs = re.findall(r'"<div id=.*?</div>"', res.text)
+        reviews = []
+
+        if raw_divs:
+            html_blocks = []
+            for d in raw_divs:
+                try:
+                    html_blocks.append(ast.literal_eval(d))
+                except Exception:
+                    pass
+            
+            soup = BeautifulSoup("\n".join(html_blocks), "html.parser")
+            cards = soup.select('[data-hook="review"]')
+            
+            for card in cards:
+                # 提取星级
+                star_el = card.select_one('[data-hook="review-star-rating"] span.a-icon-alt') or card.select_one('.a-icon-alt')
+                stars = star_el.get_text(strip=True) if star_el else "3.0 out of 5 stars"
+                
+                # 提取标题
+                title_el = card.select_one('[data-hook="review-title"] span:not(.a-letter-space)') or card.select_one('[data-hook="review-title"]')
+                title = title_el.get_text(strip=True) if title_el else ""
+                if "stars" in title:
+                    title = title.split("stars")[-1].strip()
+                    
+                # 提取正文
+                body_el = card.select_one('[data-hook="review-body"]')
+                body = body_el.get_text(strip=True) if body_el else ""
+                
+                if body:
+                    reviews.append({'stars': stars, 'title': title, 'body': body})
+
+        # 策略 2：如果 AST 匹配为空，启动全文正则抽取作为兜底
+        if not reviews:
+            print("[*] Falling back to direct regex extraction...")
+            bodies = re.findall(r'data-hook=\\"review-body\\"[^>]*>.*?<span[^>]*>(.*?)</span>', res.text)
+            titles = re.findall(r'data-hook=\\"review-title\\"[^>]*>.*?<span[^>]*>(.*?)</span>', res.text)
+            
+            for i in range(min(len(bodies), len(titles))):
+                clean_body = re.sub(r'<.*?>', '', bodies[i]).replace('\\n', ' ').strip()
+                clean_title = re.sub(r'<.*?>', '', titles[i]).replace('\\n', ' ').strip()
+                if clean_body:
+                    reviews.append({
+                        'stars': "Customer Review",
+                        'title': clean_title,
+                        'body': clean_body
+                    })
+
+        print(f"[+] Total reviews successfully parsed for {asin}: {len(reviews)}")
+        return reviews
+        
+    except Exception as e:
+        print(f"[!] Error fetching AJAX for {asin}: {e}")
+        return []
 
 def categorize_pain_points(reviews):
     buckets = {
@@ -142,7 +150,7 @@ def categorize_pain_points(reviews):
         "内容过时 / 与新考试不符 (Outdated Content)": [],
         "线上激活码失效 / 强制注册 (Online Code / Login Traps)": [],
         "题目太少 / 刷题不尽兴 (Not Enough Practice)": [],
-        "其他买家吐槽 (General Dissatisfaction)": []
+        "一般买家吐槽与改进期待 (Specific Complaints)": []
     }
     
     for r in reviews:
@@ -169,7 +177,7 @@ def categorize_pain_points(reviews):
             matched = True
             
         if not matched:
-            buckets["其他买家吐槽 (General Dissatisfaction)"].append(r)
+            buckets["一般买家吐槽与改进期待 (Specific Complaints)"].append(r)
             
     return buckets
 
@@ -204,7 +212,7 @@ def generate_markdown_report(targets_data):
             md.append("*(该竞品暂未捕获到明显的负面抱怨段落)*\n")
 
         md.append("\n### 💡 针对该竞品的反制出版方案 (Counter-Strategy):\n")
-        valid_buckets = {k: v for k, v in buckets.items() if k != "其他买家吐槽 (General Dissatisfaction)" and len(v) > 0}
+        valid_buckets = {k: v for k, v in buckets.items() if k != "一般买家吐槽与改进期待 (Specific Complaints)" and len(v) > 0}
         top_flaw = max(valid_buckets.items(), key=lambda x: len(x[1]))[0] if valid_buckets else "答案错误 / 题目有 Bug (Errors in Answers)"
         
         md.append(f"- **核心反杀卖点**: 强攻 **【{top_flaw}】**。\n")
@@ -221,7 +229,7 @@ def generate_markdown_report(targets_data):
 def main():
     top_targets = get_top_asins(limit=3)
     if not top_targets:
-        print("[!] No valid top BSR ASINs found.")
+        print("[!] No valid top BSR ASINs found in report.")
         return
         
     session = requests.Session()
@@ -234,7 +242,7 @@ def main():
     all_analyzed = []
     for target in top_targets:
         print(f"[*] Analyzing competitor ASIN: {target['asin']} (#{target['bsr']})")
-        revs = scrape_reviews_for_asin(session, target['asin'])
+        revs = fetch_reviews_via_ajax(session, target['asin'])
         target['reviews'] = revs
         all_analyzed.append(target)
         
