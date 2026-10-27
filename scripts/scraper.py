@@ -3,12 +3,13 @@ import re
 import csv
 import time
 import random
+import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TARGETS_FILE = os.path.join(BASE_DIR, 'data', 'targets.txt')
+KEYWORDS_FILE = os.path.join(BASE_DIR, 'data', 'keywords.txt')
 OUTPUT_FILE = os.path.join(BASE_DIR, 'data', 'bsr_report.csv')
 
 USER_AGENTS = [
@@ -28,11 +29,46 @@ def get_headers():
         'DNT': '1'
     }
 
+def discover_asins_by_keyword(keyword, limit=10):
+    """
+    根据关键词自动搜索亚马逊图书，自动提取前排自然排名的 ASIN
+    """
+    encoded_kw = urllib.parse.quote_plus(keyword)
+    # 锁定 Books 类目进行搜索
+    url = f"https://www.amazon.com/s?k={encoded_kw}&i=stripbooks"
+    headers = get_headers()
+    
+    print(f"[*] Discovering targets for keyword: '{keyword}'...")
+    time.sleep(random.uniform(5, 10))
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=25)
+        if res.status_code != 200 or "api-services-support@amazon.com" in res.text:
+            print(f"[!] Search blocked or captcha for '{keyword}'")
+            return []
+            
+        soup = BeautifulSoup(res.text, 'html.parser')
+        # 匹配搜索结果页中所有带 data-asin 的卡片
+        cards = soup.find_all('div', {'data-asin': True})
+        
+        found_asins = []
+        for card in cards:
+            asin = card.get('data-asin', '').strip()
+            # 过滤广告位（Sponsored）以及空 ASIN
+            is_sponsored = "s-sponsored-label" in card.get_text() or "Sponsored" in card.get_text()
+            if asin and not is_sponsored and len(asin) == 10:
+                if asin not in found_asins:
+                    found_asins.append(asin)
+            if len(found_asins) >= limit:
+                break
+                
+        print(f"[+] Found {len(found_asins)} organic ASINs for '{keyword}'")
+        return found_asins
+    except Exception as e:
+        print(f"[!] Search discovery error: {e}")
+        return []
+
 def extract_bsr(html_text):
-    """
-    通过正则扫描全文提取主类目（Books / Kindle Store）的 BSR 排名
-    """
-    # 规则 1：匹配 "Best Sellers Rank: #1,234 in Books" 或 "#1,234 in Kindle Store"
     patterns = [
         r'Best Sellers Rank[^\d#]*#([0-9,]+)\s+in\s+([A-Za-z\s&]+)',
         r'#([0-9,]+)\s+in\s+Books',
@@ -48,27 +84,17 @@ def extract_bsr(html_text):
     return "Not Found"
 
 def extract_rating(soup, html_text):
-    """
-    精准锁定真实用户评分，避开轮播图组件里的伪图标
-    """
-    # 策略 1：锁定评论统计容器中的星级
     rev_container = soup.find('div', {'id': 'averageCustomerReviews'})
     if rev_container:
         rating_span = rev_container.find('span', {'class': 'a-icon-alt'})
         if rating_span and 'out of 5 stars' in rating_span.text:
             return rating_span.text.strip()
-
-    # 策略 2：正则扫描 "X.X out of 5 stars"
     match = re.search(r'([0-5]\.[0-9])\s+out of 5 stars', html_text)
     if match:
         return f"{match.group(1)} out of 5 stars"
-
     return "N/A"
 
 def extract_review_count(soup, html_text):
-    """
-    提取总评论数
-    """
     count_tag = soup.find('span', {'id': 'acrCustomerReviewText'})
     if count_tag:
         count_match = re.search(r'([0-9,]+)', count_tag.text)
@@ -76,7 +102,7 @@ def extract_review_count(soup, html_text):
             return count_match.group(1).replace(',', '')
     return "0"
 
-def scrape_asin(asin):
+def scrape_asin(asin, keyword=""):
     url = f"https://www.amazon.com/dp/{asin}"
     headers = get_headers()
     
@@ -88,9 +114,8 @@ def scrape_asin(asin):
         session = requests.Session()
         res = session.get(url, headers=headers, timeout=25)
         
-        # 遇验证码直接安全退出
         if "api-services-support@amazon.com" in res.text or "Type the characters you see in this image" in res.text:
-            print(f"[!] Captcha triggered on ASIN: {asin}. Terminating cleanly.")
+            print(f"[!] Captcha triggered on ASIN: {asin}. Stopping run.")
             return None
             
         if res.status_code != 200:
@@ -98,50 +123,56 @@ def scrape_asin(asin):
             return None
             
         soup = BeautifulSoup(res.text, 'html.parser')
-        
-        # 抓取标题
         title_tag = soup.find('span', {'id': 'productTitle'})
         title = title_tag.get_text(strip=True) if title_tag else "Unknown Title"
         
-        # 提取核心数据
         bsr = extract_bsr(res.text)
         rating = extract_rating(soup, res.text)
         reviews = extract_review_count(soup, res.text)
 
         return {
             'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            'keyword': keyword,
             'asin': asin,
             'title': title[:60],
             'bsr': bsr,
             'rating': rating,
             'reviews': reviews
         }
-        
     except Exception as e:
         print(f"[!] Error on {asin}: {str(e)}")
         return None
 
 def main():
-    if not os.path.exists(TARGETS_FILE):
-        print("[!] targets.txt not found.")
+    if not os.path.exists(KEYWORDS_FILE):
+        print("[!] keywords.txt not found. Exiting.")
         return
         
-    with open(TARGETS_FILE, 'r') as f:
-        asins = [line.strip() for line in f if line.strip()]
+    with open(KEYWORDS_FILE, 'r') as f:
+        keywords = [line.strip() for line in f if line.strip()]
         
+    # 自动搜索提取 ASIN
+    all_targets = []
+    for kw in keywords:
+        asins = discover_asins_by_keyword(kw, limit=5) # 每个词自动抓前5名真实竞品
+        for asin in asins:
+            all_targets.append({'asin': asin, 'keyword': kw})
+            
+    print(f"[*] Total discovered targets across all keywords: {len(all_targets)}")
+    
     results = []
-    for asin in asins:
-        data = scrape_asin(asin)
+    for target in all_targets:
+        data = scrape_asin(target['asin'], target['keyword'])
         if data:
             results.append(data)
-            print(f"[+] Scraped {asin}: BSR={data['bsr']}, Rating={data['rating']}, Reviews={data['reviews']}")
+            print(f"[+] Scraped {target['asin']} ({data['keyword']}): BSR={data['bsr']}, Rating={data['rating']}")
         else:
-            break
+            break # 遇风控即停，保留已抓取数据
             
     if results:
         file_exists = os.path.exists(OUTPUT_FILE)
         with open(OUTPUT_FILE, 'a', newline='', encoding='utf-8') as f:
-            fieldnames = ['timestamp', 'asin', 'title', 'bsr', 'rating', 'reviews']
+            fieldnames = ['timestamp', 'keyword', 'asin', 'title', 'bsr', 'rating', 'reviews']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             if not file_exists or os.path.getsize(OUTPUT_FILE) == 0:
                 writer.writeheader()
