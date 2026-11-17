@@ -1,10 +1,10 @@
 # KDP 竞品致命差评与痛点挖掘战报
 
-> **更新时间**: 2026-11-16 10:42:12 UTC
+> **更新时间**: 2026-11-17 11:31:28 UTC
 
 ---
 
-## 🎯 目标竞品: `1394401876` (BSR: #953)
+## 🎯 目标竞品: `1394401876` (BSR: #952)
 
 **标题**: 2026/2027 ASVAB For Dummies: Book + 7 Practice Tests, Flashc
 
@@ -31,7 +31,7 @@
 
 ---
 
-## 🎯 目标竞品: `B0GRMNSB6V` (BSR: #4769)
+## 🎯 目标竞品: `B0GRMNSB6V` (BSR: #4768)
 
 **标题**: ASVAB Study Guide & Test Prep [2 in 1]: The Ultimate All-in-
 
